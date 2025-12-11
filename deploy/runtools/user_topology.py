@@ -586,6 +586,356 @@ class UserTopologies:
         ]
 
     ########################################################################
+    # Torus and Dragonfly Topologies
+
+    def torus_topology(
+        self,
+        dim_x: int,
+        dim_y: int,
+        dim_z: Optional[int] = None,
+        servers_per_switch: int = 1,
+    ) -> None:
+        """Create a 2D or 3D torus network topology.
+
+        In a torus topology, switches are arranged in a grid pattern with
+        wrap-around edges. Each switch connects to its immediate neighbors
+        in each dimension.
+
+        Args:
+            dim_x: Size of the torus in the X dimension
+            dim_y: Size of the torus in the Y dimension
+            dim_z: Optional size in Z dimension for 3D torus. If None, creates 2D torus.
+            servers_per_switch: Number of server nodes attached to each switch
+
+        Example:
+            torus_topology(dim_x=4, dim_y=4)  # 4x4 2D torus with 16 switches
+            torus_topology(dim_x=4, dim_y=4, dim_z=4)  # 4x4x4 3D torus with 64 switches
+        """
+        if dim_z is None:
+            # 2D Torus
+            total_switches = dim_x * dim_y
+            switches = [[FireSimSwitchNode() for _ in range(dim_y)] for _ in range(dim_x)]
+            servers = [
+                [FireSimServerNode() for _ in range(servers_per_switch)]
+                for _ in range(total_switches)
+            ]
+
+            # Flatten switches for easier indexing
+            switch_list = []
+            for i in range(dim_x):
+                for j in range(dim_y):
+                    switch_list.append(switches[i][j])
+
+            # Connect switches in X dimension (with wrap-around)
+            # Each link is bidirectional - uplinks are automatically created
+            for i in range(dim_x):
+                for j in range(dim_y):
+                    # Connect to neighbor in +X direction (wrap-around)
+                    x_neighbor = switches[(i + 1) % dim_x][j]
+                    switches[i][j].add_downlink(x_neighbor)
+
+            # Connect switches in Y dimension (with wrap-around)
+            for i in range(dim_x):
+                for j in range(dim_y):
+                    # Connect to neighbor in +Y direction (wrap-around)
+                    y_neighbor = switches[i][(j + 1) % dim_y]
+                    switches[i][j].add_downlink(y_neighbor)
+
+            # Attach servers to switches
+            server_idx = 0
+            for i in range(dim_x):
+                for j in range(dim_y):
+                    switches[i][j].add_downlinks(servers[server_idx])
+                    server_idx += 1
+
+            # Set roots to first row of switches (arbitrary choice for tree-like structure)
+            self.roots = switches[0]
+
+        else:
+            # 3D Torus
+            total_switches = dim_x * dim_y * dim_z
+            switches = [
+                [
+                    [FireSimSwitchNode() for _ in range(dim_z)]
+                    for _ in range(dim_y)
+                ]
+                for _ in range(dim_x)
+            ]
+            servers = [
+                [FireSimServerNode() for _ in range(servers_per_switch)]
+                for _ in range(total_switches)
+            ]
+
+            # Flatten switches for easier indexing
+            switch_list = []
+            for i in range(dim_x):
+                for j in range(dim_y):
+                    for k in range(dim_z):
+                        switch_list.append(switches[i][j][k])
+
+            # Connect switches in X dimension (with wrap-around)
+            # Each link is bidirectional - uplinks are automatically created
+            for i in range(dim_x):
+                for j in range(dim_y):
+                    for k in range(dim_z):
+                        # Connect to neighbor in +X direction (wrap-around)
+                        x_neighbor = switches[(i + 1) % dim_x][j][k]
+                        switches[i][j][k].add_downlink(x_neighbor)
+
+            # Connect switches in Y dimension (with wrap-around)
+            for i in range(dim_x):
+                for j in range(dim_y):
+                    for k in range(dim_z):
+                        # Connect to neighbor in +Y direction (wrap-around)
+                        y_neighbor = switches[i][(j + 1) % dim_y][k]
+                        switches[i][j][k].add_downlink(y_neighbor)
+
+            # Connect switches in Z dimension (with wrap-around)
+            for i in range(dim_x):
+                for j in range(dim_y):
+                    for k in range(dim_z):
+                        # Connect to neighbor in +Z direction (wrap-around)
+                        z_neighbor = switches[i][j][(k + 1) % dim_z]
+                        switches[i][j][k].add_downlink(z_neighbor)
+
+            # Attach servers to switches
+            server_idx = 0
+            for i in range(dim_x):
+                for j in range(dim_y):
+                    for k in range(dim_z):
+                        switches[i][j][k].add_downlinks(servers[server_idx])
+                        server_idx += 1
+
+            # Set roots to first row of first plane (arbitrary choice for tree-like structure)
+            self.roots = switches[0][0]
+
+        # Default mapping: round-robin allocation
+        def custom_mapper(fsim_topol_with_passes: FireSimTopologyWithPasses) -> None:
+            """Default mapper for torus topology using round-robin allocation."""
+            # Get all switches and servers
+            all_switches = fsim_topol_with_passes.topology.get_dfs_order_switches()
+            all_servers = fsim_topol_with_passes.topology.get_dfs_order_servers()
+
+            # Allocate switches to switch-only hosts
+            switch_inst_handle = (
+                fsim_topol_with_passes.run_farm.get_switch_only_host_handle()
+            )
+            switch_inst = fsim_topol_with_passes.run_farm.allocate_sim_host(
+                switch_inst_handle
+            )
+            for switch in all_switches:
+                switch_inst.add_switch(switch)
+
+            # Allocate servers to sim hosts
+            # Group servers by their parent switch for efficient packing
+            servers_by_switch: Dict[FireSimSwitchNode, List[FireSimServerNode]] = {}
+            for server in all_servers:
+                # Find parent switch (the switch this server is connected to)
+                parent_switch = None
+                for link in server.uplinks:
+                    if isinstance(link.get_uplink_side(), FireSimSwitchNode):
+                        parent_switch = link.get_uplink_side()
+                        break
+                if parent_switch:
+                    if parent_switch not in servers_by_switch:
+                        servers_by_switch[parent_switch] = []
+                    servers_by_switch[parent_switch].append(server)
+
+            # Allocate servers in groups
+            for switch, switch_servers in servers_by_switch.items():
+                num_sims = len(switch_servers)
+                inst_handle = (
+                    fsim_topol_with_passes.run_farm.get_smallest_sim_host_handle(
+                        num_sims=num_sims
+                    )
+                )
+                sim_inst = fsim_topol_with_passes.run_farm.allocate_sim_host(
+                    inst_handle
+                )
+                for sim in switch_servers:
+                    sim_inst.add_simulation(sim)
+
+        self.custom_mapper = custom_mapper
+
+    def dragonfly_topology(
+        self,
+        groups: int,
+        switches_per_group: int,
+        local_degree: int,
+        global_degree: int,
+        servers_per_switch: int = 1,
+    ) -> None:
+        """Create a dragonfly network topology.
+
+        A dragonfly topology consists of groups of switches. Each switch has:
+        - Local links: connections to other switches within the same group
+        - Global links: connections to switches in other groups
+
+        The topology aims for minimal diameter (often 3 hops).
+
+        Args:
+            groups: Number of groups in the topology
+            switches_per_group: Number of switches in each group
+            local_degree: Number of local links per switch (to other switches in same group)
+            global_degree: Number of global links per switch (to switches in other groups)
+            servers_per_switch: Number of server nodes attached to each switch
+
+        Example:
+            dragonfly_topology(
+                groups=4,
+                switches_per_group=8,
+                local_degree=4,
+                global_degree=2
+            )
+        """
+        total_switches = groups * switches_per_group
+
+        # Validate parameters
+        if local_degree >= switches_per_group:
+            raise ValueError(
+                f"local_degree ({local_degree}) must be less than "
+                f"switches_per_group ({switches_per_group})"
+            )
+        if global_degree >= groups:
+            raise ValueError(
+                f"global_degree ({global_degree}) must be less than groups ({groups})"
+            )
+
+        # Create switches organized by groups
+        switch_groups: List[List[FireSimSwitchNode]] = []
+        for g in range(groups):
+            group_switches = [FireSimSwitchNode() for _ in range(switches_per_group)]
+            switch_groups.append(group_switches)
+
+        # Create servers for each switch
+        servers = [
+            [FireSimServerNode() for _ in range(servers_per_switch)]
+            for _ in range(total_switches)
+        ]
+
+        # Create local links within each group
+        # Use a simple pattern: connect each switch to its next 'local_degree' neighbors
+        for group_idx, group_switches in enumerate(switch_groups):
+            for switch_idx, switch in enumerate(group_switches):
+                # Connect to local_degree neighbors in a round-robin fashion
+                for link_offset in range(1, local_degree + 1):
+                    neighbor_idx = (switch_idx + link_offset) % switches_per_group
+                    neighbor = group_switches[neighbor_idx]
+                    switch.add_downlink(neighbor)
+
+        # Create global links between groups
+        # Each switch connects to switches in other groups
+        # Use a deterministic pattern to ensure connectivity
+        for group_idx, group_switches in enumerate(switch_groups):
+            for switch_idx, switch in enumerate(group_switches):
+                # Determine which groups this switch should connect to
+                # Use a pattern that distributes global links evenly
+                target_groups = []
+                for g_offset in range(1, groups):
+                    target_group = (group_idx + g_offset) % groups
+                    target_groups.append(target_group)
+
+                # Select global_degree groups to connect to
+                # Use switch index to determine which groups to connect to
+                selected_groups = []
+                for i in range(global_degree):
+                    if i < len(target_groups):
+                        selected_groups.append(target_groups[i])
+
+                # Connect to one switch in each selected group
+                for target_group_idx in selected_groups:
+                    target_group = switch_groups[target_group_idx]
+                    # Use switch index to determine which switch in target group
+                    target_switch_idx = (
+                        switch_idx + group_idx
+                    ) % switches_per_group
+                    target_switch = target_group[target_switch_idx]
+                    switch.add_downlink(target_switch)
+
+        # Attach servers to switches
+        server_idx = 0
+        for group_switches in switch_groups:
+            for switch in group_switches:
+                switch.add_downlinks(servers[server_idx])
+                server_idx += 1
+
+        # Set roots to first switch of first group (arbitrary choice)
+        self.roots = [switch_groups[0][0]]
+
+        # Default mapping: allocate switches and servers
+        def custom_mapper(fsim_topol_with_passes: FireSimTopologyWithPasses) -> None:
+            """Default mapper for dragonfly topology."""
+            # Get all switches and servers
+            all_switches = fsim_topol_with_passes.topology.get_dfs_order_switches()
+            all_servers = fsim_topol_with_passes.topology.get_dfs_order_servers()
+
+            # Allocate switches to switch-only hosts
+            # For simplicity, put all switches on one host
+            switch_inst_handle = (
+                fsim_topol_with_passes.run_farm.get_switch_only_host_handle()
+            )
+            switch_inst = fsim_topol_with_passes.run_farm.allocate_sim_host(
+                switch_inst_handle
+            )
+            for switch in all_switches:
+                switch_inst.add_switch(switch)
+
+            # Allocate servers grouped by their parent switch
+            servers_by_switch: Dict[FireSimSwitchNode, List[FireSimServerNode]] = {}
+            for server in all_servers:
+                parent_switch = None
+                for link in server.uplinks:
+                    if isinstance(link.get_uplink_side(), FireSimSwitchNode):
+                        parent_switch = link.get_uplink_side()
+                        break
+                if parent_switch:
+                    if parent_switch not in servers_by_switch:
+                        servers_by_switch[parent_switch] = []
+                    servers_by_switch[parent_switch].append(server)
+
+            # Allocate servers in groups
+            for switch, switch_servers in servers_by_switch.items():
+                num_sims = len(switch_servers)
+                inst_handle = (
+                    fsim_topol_with_passes.run_farm.get_smallest_sim_host_handle(
+                        num_sims=num_sims
+                    )
+                )
+                sim_inst = fsim_topol_with_passes.run_farm.allocate_sim_host(
+                    inst_handle
+                )
+                for sim in switch_servers:
+                    sim_inst.add_simulation(sim)
+
+        self.custom_mapper = custom_mapper
+
+    # Convenience methods for common torus configurations
+    def torus_4x4(self) -> None:
+        """4x4 2D torus topology with 16 switches."""
+        self.torus_topology(dim_x=4, dim_y=4)
+
+    def torus_8x8(self) -> None:
+        """8x8 2D torus topology with 64 switches."""
+        self.torus_topology(dim_x=8, dim_y=8)
+
+    def torus_4x4x4(self) -> None:
+        """4x4x4 3D torus topology with 64 switches."""
+        self.torus_topology(dim_x=4, dim_y=4, dim_z=4)
+
+    # Convenience methods for common dragonfly configurations
+    def dragonfly_4_8_4_2(self) -> None:
+        """Dragonfly topology: 4 groups, 8 switches/group, local_degree=4, global_degree=2."""
+        self.dragonfly_topology(
+            groups=4, switches_per_group=8, local_degree=4, global_degree=2
+        )
+
+    def dragonfly_8_16_8_4(self) -> None:
+        """Dragonfly topology: 8 groups, 16 switches/group, local_degree=8, global_degree=4."""
+        self.dragonfly_topology(
+            groups=8, switches_per_group=16, local_degree=8, global_degree=4
+        )
+
+    ########################################################################
 
     # DOC include start: user_topology.py fireaxe_topology_config
     def fireaxe_topology_config(
