@@ -713,8 +713,8 @@ class UserTopologies:
         def custom_mapper(fsim_topol_with_passes: FireSimTopologyWithPasses) -> None:
             """Default mapper for torus topology using round-robin allocation."""
             # Get all switches and servers
-            all_switches = fsim_topol_with_passes.topology.get_dfs_order_switches()
-            all_servers = fsim_topol_with_passes.topology.get_dfs_order_servers()
+            all_switches = fsim_topol_with_passes.firesimtopol.get_dfs_order_switches()
+            all_servers = fsim_topol_with_passes.firesimtopol.get_dfs_order_servers()
 
             # Allocate switches to switch-only hosts
             switch_inst_handle = (
@@ -726,34 +726,41 @@ class UserTopologies:
             for switch in all_switches:
                 switch_inst.add_switch(switch)
 
-            # Allocate servers to sim hosts
-            # Group servers by their parent switch for efficient packing
-            servers_by_switch: Dict[FireSimSwitchNode, List[FireSimServerNode]] = {}
-            for server in all_servers:
-                # Find parent switch (the switch this server is connected to)
-                parent_switch = None
-                for link in server.uplinks:
-                    if isinstance(link.get_uplink_side(), FireSimSwitchNode):
-                        parent_switch = link.get_uplink_side()
-                        break
-                if parent_switch:
-                    if parent_switch not in servers_by_switch:
-                        servers_by_switch[parent_switch] = []
-                    servers_by_switch[parent_switch].append(server)
-
-            # Allocate servers in groups
-            for switch, switch_servers in servers_by_switch.items():
-                num_sims = len(switch_servers)
-                inst_handle = (
-                    fsim_topol_with_passes.run_farm.get_smallest_sim_host_handle(
-                        num_sims=num_sims
-                    )
-                )
-                sim_inst = fsim_topol_with_passes.run_farm.allocate_sim_host(
-                    inst_handle
-                )
-                for sim in switch_servers:
-                    sim_inst.add_simulation(sim)
+            # Allocate servers to sim hosts using round-robin to pack efficiently
+            # Allocate servers in round-robin fashion across available hosts
+            current_host = None
+            servers_on_current_host = 0
+            max_servers_per_host = 0
+            
+            for idx, server in enumerate(all_servers):
+                # Allocate a new host when needed
+                if current_host is None or servers_on_current_host >= max_servers_per_host:
+                    try:
+                        inst_handle_for_one = (
+                            fsim_topol_with_passes.run_farm.get_smallest_sim_host_handle(
+                                num_sims=1
+                            )
+                        )
+                        current_host = fsim_topol_with_passes.run_farm.allocate_sim_host(
+                            inst_handle_for_one
+                        )
+                        # Get the max capacity of this host
+                        if fsim_topol_with_passes.run_farm.metasimulation_enabled:
+                            max_servers_per_host = fsim_topol_with_passes.run_farm.SIM_HOST_HANDLE_TO_MAX_METASIM_SLOTS.get(
+                                inst_handle_for_one, 1
+                            )
+                        else:
+                            max_servers_per_host = fsim_topol_with_passes.run_farm.SIM_HOST_HANDLE_TO_MAX_FPGA_SLOTS.get(
+                                inst_handle_for_one, 1
+                            )
+                        servers_on_current_host = 0
+                    except:
+                        # If we run out of hosts, pack remaining on the last host
+                        pass
+                
+                if current_host is not None:
+                    current_host.add_simulation(server)
+                    servers_on_current_host += 1
 
         self.custom_mapper = custom_mapper
 
@@ -866,8 +873,8 @@ class UserTopologies:
         def custom_mapper(fsim_topol_with_passes: FireSimTopologyWithPasses) -> None:
             """Default mapper for dragonfly topology."""
             # Get all switches and servers
-            all_switches = fsim_topol_with_passes.topology.get_dfs_order_switches()
-            all_servers = fsim_topol_with_passes.topology.get_dfs_order_servers()
+            all_switches = fsim_topol_with_passes.firesimtopol.get_dfs_order_switches()
+            all_servers = fsim_topol_with_passes.firesimtopol.get_dfs_order_servers()
 
             # Allocate switches to switch-only hosts
             # For simplicity, put all switches on one host
@@ -880,32 +887,41 @@ class UserTopologies:
             for switch in all_switches:
                 switch_inst.add_switch(switch)
 
-            # Allocate servers grouped by their parent switch
-            servers_by_switch: Dict[FireSimSwitchNode, List[FireSimServerNode]] = {}
-            for server in all_servers:
-                parent_switch = None
-                for link in server.uplinks:
-                    if isinstance(link.get_uplink_side(), FireSimSwitchNode):
-                        parent_switch = link.get_uplink_side()
-                        break
-                if parent_switch:
-                    if parent_switch not in servers_by_switch:
-                        servers_by_switch[parent_switch] = []
-                    servers_by_switch[parent_switch].append(server)
-
-            # Allocate servers in groups
-            for switch, switch_servers in servers_by_switch.items():
-                num_sims = len(switch_servers)
-                inst_handle = (
-                    fsim_topol_with_passes.run_farm.get_smallest_sim_host_handle(
-                        num_sims=num_sims
-                    )
-                )
-                sim_inst = fsim_topol_with_passes.run_farm.allocate_sim_host(
-                    inst_handle
-                )
-                for sim in switch_servers:
-                    sim_inst.add_simulation(sim)
+            # Allocate servers to sim hosts using round-robin to pack efficiently
+            # Allocate servers in round-robin fashion across available hosts
+            current_host = None
+            servers_on_current_host = 0
+            max_servers_per_host = 0
+            
+            for idx, server in enumerate(all_servers):
+                # Allocate a new host when needed
+                if current_host is None or servers_on_current_host >= max_servers_per_host:
+                    try:
+                        inst_handle_for_one = (
+                            fsim_topol_with_passes.run_farm.get_smallest_sim_host_handle(
+                                num_sims=1
+                            )
+                        )
+                        current_host = fsim_topol_with_passes.run_farm.allocate_sim_host(
+                            inst_handle_for_one
+                        )
+                        # Get the max capacity of this host
+                        if fsim_topol_with_passes.run_farm.metasimulation_enabled:
+                            max_servers_per_host = fsim_topol_with_passes.run_farm.SIM_HOST_HANDLE_TO_MAX_METASIM_SLOTS.get(
+                                inst_handle_for_one, 1
+                            )
+                        else:
+                            max_servers_per_host = fsim_topol_with_passes.run_farm.SIM_HOST_HANDLE_TO_MAX_FPGA_SLOTS.get(
+                                inst_handle_for_one, 1
+                            )
+                        servers_on_current_host = 0
+                    except:
+                        # If we run out of hosts, pack remaining on the last host
+                        pass
+                
+                if current_host is not None:
+                    current_host.add_simulation(server)
+                    servers_on_current_host += 1
 
         self.custom_mapper = custom_mapper
 
@@ -924,6 +940,12 @@ class UserTopologies:
 
     # Convenience methods for common dragonfly configurations
     def dragonfly_4_8_4_2(self) -> None:
+        """Dragonfly topology: 4 groups, 8 switches/group, local_degree=4, global_degree=2."""
+        self.dragonfly_topology(
+            groups=4, switches_per_group=8, local_degree=4, global_degree=2
+        )
+        
+    def dragonfly_2_8_4_2(self) -> None:
         """Dragonfly topology: 4 groups, 8 switches/group, local_degree=4, global_degree=2."""
         self.dragonfly_topology(
             groups=4, switches_per_group=8, local_degree=4, global_degree=2
