@@ -908,6 +908,12 @@ class FireSimSwitchNode(FireSimNode):
     switch_link_latency: Optional[int]
     switch_switching_latency: Optional[int]
     switch_bandwidth: Optional[int]
+    switch_buffer_drop_enabled: int
+    switch_buffer_size: int
+    switch_link_fail_port: int
+    switch_link_fail_start: int
+    switch_link_fail_duration: int
+    switch_ecmp_mode: int
     switch_builder: AbstractSwitchToSwitchConfig
 
     def __init__(
@@ -915,6 +921,12 @@ class FireSimSwitchNode(FireSimNode):
         switching_latency: Optional[int] = None,
         link_latency: Optional[int] = None,
         bandwidth: Optional[int] = None,
+        buffer_drop_enabled: int = 0,
+        buffer_size: int = 131072,
+        link_fail_port: int = -1,
+        link_fail_start: int = 0,
+        link_fail_duration: int = 0,
+        ecmp_mode: int = 0,
     ):
         super().__init__()
         self.switch_id_internal = FireSimSwitchNode.SWITCHES_CREATED
@@ -923,6 +935,15 @@ class FireSimSwitchNode(FireSimNode):
         self.switch_link_latency = link_latency
         self.switch_switching_latency = switching_latency
         self.switch_bandwidth = bandwidth
+        # Buffer configuration (safe defaults: drops disabled)
+        self.switch_buffer_drop_enabled = buffer_drop_enabled  # 0=disabled (safe for bare-metal)
+        self.switch_buffer_size = buffer_size  # in flits
+        # Link failure configuration (safe defaults: no failures)
+        self.switch_link_fail_port = link_fail_port  # -1=no failure
+        self.switch_link_fail_start = link_fail_start  # cycle to start failure
+        self.switch_link_fail_duration = link_fail_duration  # 0=permanent
+        # ECMP configuration (safe default: random)
+        self.switch_ecmp_mode = ecmp_mode  # 0=random, 1=hash-based
 
         # switch_builder is a class designed to emit a particular switch model.
         # it should take self and then be able to emit a particular switch model's

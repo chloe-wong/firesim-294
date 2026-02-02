@@ -43,13 +43,23 @@ int switchlat = 0;
 int throttle_numer = 1;
 int throttle_denom = 1;
 
-// uncomment to use a limited output buffer size, OUTPUT_BUF_SIZE
-//#define LIMITED_BUFSIZE
+// param: output buffer size and drop behavior
+// Used to model finite egress buffers with tail-drop congestion management
+//
+// THESE ARE SET BY A COMMAND LINE ARGUMENT. DO NOT CHANGE IT HERE.
+// IMPORTANT: Only enable buffer drops when running with a full OS (Linux/FreeBSD)
+//            that has a TCP/IP stack to handle retransmissions!
+//            For bare-metal simulations, keep buffer_drop_enabled = 0.
+long output_buffer_size = 131072L;  // size in flits (default: ~8MB at 64B/flit)
+int buffer_drop_enabled = 0;        // 0 = disabled (safe for bare-metal)
+                                     // 1 = enabled (requires TCP/IP stack)
 
-// size of output buffers, in # of flits
-// only if LIMITED BUFSIZE is set
-// TODO: expose in manager
-#define OUTPUT_BUF_SIZE (131072L)
+// param: ECMP routing mode
+// Controls how multiple equal-cost paths are selected
+//
+// THIS IS SET BY A COMMAND LINE ARGUMENT. DO NOT CHANGE IT HERE.
+int ecmp_mode = ECMP_RANDOM;        // 0 = random (original)
+                                     // 1 = hash-based flow-aware ECMP
 
 // pull in # clients config
 #define NUMCLIENTSCONFIG
@@ -180,6 +190,12 @@ void do_fast_switching() {
     pqueue.pop();
     uint16_t send_to_port =
         get_port_from_flit(tsp->dat[0], 0 /* junk remove arg */);
+    
+    // If port requires uplink selection (multiple paths), apply ECMP
+    if (send_to_port == NUMDOWNLINKS && NUMUPLINKS > 1) {
+      send_to_port = select_uplink_port_ecmp(tsp->dat, tsp->amtwritten);
+    }
+    
     // printf("packet for port: %x\n", send_to_port);
     // printf("packet timestamp: %ld\n", tsp->timestamp);
     if (send_to_port == BROADCAST_ADJUSTED) {
@@ -229,11 +245,17 @@ int main(int argc, char *argv[]) {
 
   if (argc < 4) {
     // if insufficient args, error out
-    fprintf(stdout, "usage: ./switch LINKLATENCY SWITCHLATENCY BANDWIDTH\n");
+    fprintf(stdout, "usage: ./switch LINKLATENCY SWITCHLATENCY BANDWIDTH [BUFFER_DROPS [BUFFER_SIZE [FAIL_PORT [FAIL_START [FAIL_DURATION [ECMP_MODE]]]]]]\n");
     fprintf(stdout, "insufficient args provided\n.");
     fprintf(stdout,
             "LINKLATENCY and SWITCHLATENCY should be provided in cycles.\n");
     fprintf(stdout, "BANDWIDTH should be provided in Gbps\n");
+    fprintf(stdout, "BUFFER_DROPS: optional, 0=disabled (default, safe for bare-metal), 1=enabled (requires OS)\n");
+    fprintf(stdout, "BUFFER_SIZE: optional, egress buffer size in flits (default: 131072)\n");
+    fprintf(stdout, "FAIL_PORT: optional, port number to fail (-1=none, default)\n");
+    fprintf(stdout, "FAIL_START: optional, cycle to start link failure (default: 0)\n");
+    fprintf(stdout, "FAIL_DURATION: optional, failure duration in cycles (0=permanent, default: 0)\n");
+    fprintf(stdout, "ECMP_MODE: optional, 0=random (default), 1=hash-based flow-aware ECMP\n");
     exit(1);
   }
 
@@ -241,11 +263,55 @@ int main(int argc, char *argv[]) {
   switchlat = atoi(argv[2]);
   bandwidth = atoi(argv[3]);
 
+  // Optional: Enable buffer drops (only safe with full OS/TCP stack)
+  if (argc >= 5) {
+    buffer_drop_enabled = atoi(argv[4]);
+  }
+
+  // Optional: Configure buffer size
+  if (argc >= 6) {
+    output_buffer_size = atol(argv[5]);
+  }
+
+  // Optional: Link failure simulation
+  int link_fail_port = -1;
+  uint64_t link_fail_start = 0;
+  uint64_t link_fail_duration = 0;
+  
+  if (argc >= 7) {
+    link_fail_port = atoi(argv[6]);
+  }
+  if (argc >= 8) {
+    link_fail_start = atol(argv[7]);
+  }
+  if (argc >= 9) {
+    link_fail_duration = atol(argv[8]);
+  }
+
+  // Optional: ECMP mode
+  if (argc >= 10) {
+    ecmp_mode = atoi(argv[9]);
+  }
+
   simplify_frac(bandwidth, 200, &throttle_numer, &throttle_denom);
 
   fprintf(stdout, "Using link latency: %d\n", LINKLATENCY);
   fprintf(stdout, "Using switching latency: %d\n", SWITCHLATENCY);
   fprintf(stdout, "BW throttle set to %d/%d\n", throttle_numer, throttle_denom);
+  fprintf(stdout, "Buffer drop policy: %s\n", buffer_drop_enabled ? "ENABLED (requires OS)" : "DISABLED (safe for bare-metal)");
+  if (buffer_drop_enabled) {
+    fprintf(stdout, "Egress buffer size: %ld flits (~%ld KB)\n", 
+            output_buffer_size, (output_buffer_size * 64) / 1024);
+  }
+  
+  if (link_fail_port >= 0) {
+    fprintf(stdout, "Link failure configured: port=%d, start_cycle=%ld, duration=%ld %s\n",
+            link_fail_port, link_fail_start, link_fail_duration,
+            link_fail_duration == 0 ? "(PERMANENT)" : "cycles");
+  }
+  
+  fprintf(stdout, "ECMP mode: %s\n", 
+          ecmp_mode == ECMP_HASH_FLOW ? "Hash-based (flow-aware)" : "Random (per-packet)");
 
   if ((LINKLATENCY % 7) != 0) {
     // if invalid link latency, error out.
@@ -260,6 +326,15 @@ int main(int argc, char *argv[]) {
 #define PORTSETUPCONFIG
 #include "switchconfig.h"
 #undef PORTSETUPCONFIG
+
+  // Configure link failure if specified
+  if (link_fail_port >= 0 && link_fail_port < NUMPORTS) {
+    ports[link_fail_port]->set_link_failure(link_fail_start, link_fail_duration);
+  } else if (link_fail_port >= NUMPORTS) {
+    fprintf(stderr, "ERROR: Invalid link_fail_port %d (only %d ports exist)\n", 
+            link_fail_port, NUMPORTS);
+    exit(1);
+  }
 
 #ifdef CAPTURE
   capture = fopen("capture.txt", "w");
@@ -281,6 +356,12 @@ int main(int argc, char *argv[]) {
 #pragma omp parallel for
     for (int port = 0; port < NUMPORTS; port++) {
       ports[port]->recv();
+    }
+
+    // update link states based on current cycle (for link failure simulation)
+#pragma omp parallel for
+    for (int port = 0; port < NUMPORTS; port++) {
+      ports[port]->update_link_state(this_iter_cycles_start);
     }
 
 #pragma omp parallel for

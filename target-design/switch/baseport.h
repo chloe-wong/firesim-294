@@ -10,6 +10,10 @@
 #define MAC_ETHTYPE 0x8808
 #define PAUSE_CONTROL 0x0001
 
+// External variables for configurable buffer management
+extern long output_buffer_size;
+extern int buffer_drop_enabled;
+
 struct switchpacket {
   uint64_t timestamp;
   uint64_t dat[200];
@@ -48,7 +52,14 @@ public:
   std::queue<switchpacket *> inputqueue;
   std::queue<switchpacket *> outputqueue;
 
+  // Link failure simulation
+  bool link_up = true;             // Link state: true=up, false=down (simulating cable unplug)
+  uint64_t link_fail_start = 0;    // Cycle when link goes down
+  uint64_t link_fail_duration = 0; // How long link stays down (0 = permanently down)
+
   int push_input(switchpacket *sp);
+  void set_link_failure(uint64_t start_cycle, uint64_t duration);
+  void update_link_state(uint64_t current_cycle);
 
 protected:
   int _portNo;
@@ -77,8 +88,48 @@ int BasePort::push_input(switchpacket *sp) {
     return 0;
   }
 
+  // Check if link is down - drop incoming packets
+  if (!link_up) {
+    printf("Link down on port %d: Dropping incoming packet\n", _portNo);
+    free(sp);
+    return 0;
+  }
+
   inputqueue.push(sp);
   return 1;
+}
+
+void BasePort::set_link_failure(uint64_t start_cycle, uint64_t duration) {
+  link_fail_start = start_cycle;
+  link_fail_duration = duration;
+  printf("Scheduled link failure on port %d: starts at cycle %ld, duration %ld cycles\n",
+         _portNo, start_cycle, duration);
+}
+
+void BasePort::update_link_state(uint64_t current_cycle) {
+  bool was_up = link_up;
+  
+  if (link_fail_start > 0) {
+    if (current_cycle >= link_fail_start) {
+      if (link_fail_duration == 0) {
+        // Permanent failure
+        link_up = false;
+      } else if (current_cycle < link_fail_start + link_fail_duration) {
+        // Temporary failure - link is down
+        link_up = false;
+      } else {
+        // Link has recovered
+        link_up = true;
+      }
+    }
+  }
+  
+  // Log state transitions
+  if (was_up && !link_up) {
+    printf("LINK DOWN: Port %d at cycle %ld\n", _portNo, current_cycle);
+  } else if (!was_up && link_up) {
+    printf("LINK UP: Port %d at cycle %ld\n", _portNo, current_cycle);
+  }
 }
 
 // assumes valid
@@ -98,6 +149,17 @@ void BasePort::write_flits_to_output() {
 
   this->pauseCycles -= flitswritten;
 
+  // If link is down, drop all outgoing packets and return empty buffer
+  if (!link_up) {
+    while (!(outputqueue.empty())) {
+      switchpacket *thispacket = outputqueue.front();
+      outputqueue.pop();
+      free(thispacket);
+    }
+    ((uint64_t *)current_output_buf)[0] = 0xDEADBEEFDEADBEEFL;
+    return;
+  }
+
   while (!(outputqueue.empty())) {
     switchpacket *thispacket = outputqueue.front();
     // first, check timing boundaries.
@@ -108,23 +170,24 @@ void BasePort::write_flits_to_output() {
     // confirm that a) we are allowed to send this out based on timestamp
     // b) we are allowed to send this out based on available space (TODO fix)
     if (outputtimestamp < maxtime) {
-#ifdef LIMITED_BUFSIZE
       // output-buffer size-based throttling, based on input time of first flit
-      int64_t diff = basetime + flitswritten - outputtimestamp;
-      if ((thispacket->amt_read == 0) && (diff > OUTPUT_BUF_SIZE)) {
-        // this packet would've been dropped due to buffer overflow.
-        // so, drop it.
-        printf("overflow, drop pack: intended timestamp: %ld, current "
-               "timestamp: %ld, out bufsize in # flits: %ld, diff: %ld\n",
-               outputtimestamp,
-               basetime + flitswritten,
-               OUTPUT_BUF_SIZE,
-               (int64_t)(basetime + flitswritten) - (int64_t)(outputtimestamp));
-        outputqueue.pop();
-        free(thispacket);
-        continue;
+      // Only drop packets if explicitly enabled (requires OS with TCP/IP stack)
+      if (buffer_drop_enabled) {
+        int64_t diff = basetime + flitswritten - outputtimestamp;
+        if ((thispacket->amtread == 0) && (diff > output_buffer_size)) {
+          // this packet would've been dropped due to buffer overflow.
+          // so, drop it.
+          printf("BUFFER OVERFLOW: Dropped packet. intended_ts=%ld, current_ts=%ld, "
+                 "buffer_size=%ld flits, queue_delay=%ld cycles\n",
+                 outputtimestamp,
+                 basetime + flitswritten,
+                 output_buffer_size,
+                 (int64_t)(basetime + flitswritten) - (int64_t)(outputtimestamp));
+          outputqueue.pop();
+          free(thispacket);
+          continue;
+        }
       }
-#endif
       // we can write this flit
       //
       // first, advance flitswritten to the correct start point:
